@@ -49,17 +49,20 @@ exit
 apt_init() {
 	DEPS="$1"
 	DEPS_BPO="$2"
+	DEPS_EXTRA="$3"
 	if [ -n "$DEPS_BPO" ]; then
 		BPO=${OSVER}-backports
 		case "$OSID" in
 		debian)
-			REPO=http://httpredir.debian.org/debian
+			REPO=http://deb.debian.org/debian
 			;;
 		ubuntu)
 			REPO=http://archive.ubuntu.com/ubuntu
 			;;
 		esac
 		sudo sh -c "printf \"deb $REPO ${OSVER}-backports main\" > /etc/apt/sources.list.d/${OSVER}-backports.list"
+		[ -n "$DEPS_EXTRA" -a "$DEPS_EXTRA" = "sloppy" ] &&
+			sudo sh -c "printf \"\\ndeb $REPO ${OSVER}-backports-sloppy main\" >> /etc/apt/sources.list.d/${OSVER}-backports.list"
 		sudo apt-get update
 		sudo apt-get install --no-install-recommends -y -t $BPO $DEPS_BPO
 	else
@@ -73,9 +76,12 @@ apt_clean() {
 	sudo apt-get purge -y $DEPS $DEPS_BPO debhelper \
 		libbloom-dev libcork-dev libcorkipset-dev libmbedtls-dev libsodium-dev
 	sudo apt-get purge -y libcork-build-deps libcorkipset-build-deps \
-		libbloom-build-deps libsodium-build-deps mbedtls-build-deps
-	sudo apt-get purge -y simple-obfs-build-deps shadowsocks-libev-build-deps
+		libsodium-build-deps mbedtls-build-deps
+	sudo apt-get purge -y libbloom-build-deps
+	sudo apt-get purge -y simple-obfs-build-deps
+	sudo apt-get purge -y shadowsocks-libev-build-deps
 
+if [ $BUILD_KCP -eq 1 ]; then
 	sudo apt-get purge -y golang-github-klauspost-reedsolomon-build-deps \
 		golang-github-xtaci-kcp-build-deps golang-github-xtaci-smux-build-deps \
 		kcptun-build-deps
@@ -88,6 +94,8 @@ apt_clean() {
 	sudo apt-get purge -y golang-github-urfave-cli-dev
 	sudo apt-get purge -y golang-github-pkg-errors-dev \
 		golang-github-golang-snappy-dev dh-golang
+fi
+
 	sudo apt-get autoremove -y
 }
 
@@ -97,7 +105,9 @@ gbp_build() {
 	PROJECT_NAME=$(basename $1|sed s/\.git$//)
 	gbp clone --pristine-tar $REPO
 	cd $PROJECT_NAME
-	git checkout $BRANCH
+	[ -n "$BRANCH" ] && git checkout $BRANCH
+	[ -n "$BRANCH" -a "$BRANCH" = "trusty" ] && # try to rebase the trusty patch
+		if ! git rebase master; then git rebase --abort; git rebase debian; fi
 	[ -n "$DEPS_BPO" ] && BPO_REPO="-t ${OSVER}-backports"
 	mk-build-deps --root-cmd sudo --install --tool "apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends -y $BPO_REPO"
 	rm -f ${PROJECT_NAME}-build-deps_*.deb
@@ -113,7 +123,7 @@ git_build() {
 	PROJECT_NAME=$(basename $1|sed s/\.git$//)
 	git clone $REPO
 	cd $PROJECT_NAME
-	git checkout $BRANCH
+	[ -n "$BRANCH" ] && git checkout $BRANCH
 	mk-build-deps --root-cmd sudo --install --tool "apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends -y"
 	rm ${PROJECT_NAME}-build-deps_*.deb
 	gbp buildpackage -us -uc --git-ignore-branch
@@ -181,7 +191,22 @@ fi
 build_install_libsodium() {
 if [ $BUILD_LIB -eq 1 -o $BUILD_BIN -eq 1 ]; then
 	if [ $BUILD_LIB -eq 1 ]; then
-		dsc_build http://httpredir.debian.org/debian/pool/main/libs/libsodium/libsodium_1.0.11-1~bpo8+1.dsc
+		git clone https://github.com/gcsideal/debian-libsodium.git libsodium
+		cd libsodium; LIBSODIUM=$(dpkg-parsechangelog --show-field Version); cd -
+		dget -ud http://deb.debian.org/debian/pool/main/libs/libsodium/libsodium_${LIBSODIUM}.dsc
+		DHVER=$(dpkg -l debhelper|grep debhelper|awk '{print $3}'|head -n1)
+		cd libsodium
+		if dpkg --compare-versions $DHVER lt 10; then
+			sed -i 's/debhelper ( >= 10)/debhelper (>= 9), dh-autoreconf/' debian/control;
+			echo 9 > debian/compat;
+			dch -D unstable -l~bpo~ "Rebuild as backports"
+			git add -u;
+			git commit -m "Patch to work with ubuntu"
+		fi
+		mk-build-deps --root-cmd sudo --install --tool "apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends -y"
+		rm libsodium-build-deps_*.deb
+		gbp buildpackage -us -uc --git-ignore-branch --git-tarball-dir=.. --git-export-dir=.. --git-overlay
+		cd -
 	else
 		ls libsodium*.deb 2>&1 > /dev/null ||
 			help_lib libsodium
@@ -195,7 +220,7 @@ build_install_libbloom() {
 if [ $BUILD_LIB -eq 1 -o $BUILD_BIN -eq 1 ]; then
 	BRANCH=$1
 	if [ $BUILD_LIB -eq 1 ]; then
-		gbp_build https://github.com/rogers0/libbloom $BRANCH
+		gbp_build https://anonscm.debian.org/git/collab-maint/libbloom.git $BRANCH
 	else
 		ls libbloom-dev_*.deb libbloom1_*.deb 2>&1 > /dev/null ||
 			help_lib "libbloom-dev libbloom1"
@@ -210,10 +235,11 @@ if [ $BUILD_BIN -eq 1 ]; then
 	BRANCH=$1
 	gbp clone --pristine-tar https://anonscm.debian.org/git/collab-maint/shadowsocks-libev.git
 	cd shadowsocks-libev
-	git checkout $BRANCH
+	[ -n "$BRANCH" ] && git checkout $BRANCH
 	sed -i 's/dh $@/dh $@ --with systemd,autoreconf/' debian/rules
 	sed -i 's/debhelper (>= 10)/debhelper (>= 9), dh-systemd, dh-autoreconf/' debian/control
 	echo 9 > debian/compat
+	dch -D unstable -l~bpo~ "Rebuild as backports"
 	git add -u
 	git commit -m "Patch to work with ubuntu trusty (14.04)"
 	cd -
@@ -234,7 +260,7 @@ fi
 build_install_simpleobfs() {
 if [ $BUILD_BIN -eq 1 ]; then
 	BRANCH=$1
-	git_build https://github.com/rogers0/simple-obfs $BRANCH
+	git_build https://anonscm.debian.org/git/collab-maint/simple-obfs.git $BRANCH
 	sudo dpkg -i simple-obfs_*.deb
 	sudo apt-get install -fy
 fi
@@ -276,8 +302,9 @@ if [ $BUILD_KCP -eq 1 ]; then
 	BRANCH=$1
 	gbp clone --pristine-tar https://anonscm.debian.org/git/pkg-go/packages/golang-github-urfave-cli.git
 	cd golang-github-urfave-cli
-	git checkout $BRANCH
+	[ -n "$BRANCH" ] && git checkout $BRANCH
 	sed -i 's/golang-github-burntsushi-toml-dev/golang-toml-dev/; s/golang-gopkg-yaml.v2-dev/golang-yaml.v2-dev/' debian/control
+	dch -D unstable -l~bpo~ "Rebuild as backports"
 	git add -u
 	git commit -m "Patch to work with ubuntu xenial (16.04)"
 	cd -
@@ -369,13 +396,17 @@ esac
 
 case "$OSVER" in
 jessie)
-	BPO="debhelper libsodium-dev"
+	BPO="debhelper libbloom-dev"
+	BPOEXTRA=sloppy
+	;;
+stretch)
+	BPO=libbloom-dev
 	;;
 xenial)
 	BPO=debhelper
 	;;
 esac
-apt_init "git-buildpackage pristine-tar equivs" "$BPO"
+apt_init "git-buildpackage pristine-tar equivs" "$BPO" $BPOEXTRA
 
 [ $BUILD_KCP -eq 1 ] && case "$OSVER" in
 wheezy|precise|trusty)
@@ -411,27 +442,32 @@ esac
 wheezy|precise)
 	echo Sorry, your system $OSID/$OSVER is not supported.
 	;;
-jessie|stretch|unstable|sid|zesty)
-	build_install_libbloom exp1
-	build_install_sslibev exp1
-	build_install_simpleobfs exp1
+jessie|stretch|buster|testing|unstable|sid)
+	build_install_sslibev
+	;;
+zesty)
+	build_install_libsodium
+	build_install_libbloom
+	build_install_sslibev
+	build_install_simpleobfs
+	;;
+xenial|yakkety)
+	build_install_libcork debian
+	build_install_libcorkipset debian
+	build_install_libsodium
+	build_install_libbloom
+	build_install_sslibev
+	build_install_simpleobfs
 	;;
 trusty)
 	build_install_libcork trusty
 	build_install_libcorkipset trusty
 	build_install_libmbedtls debian/jessie-backports
 	build_install_libsodium
-	build_install_libbloom exp1_trusty
-	patch_sslibev_dh9 exp1
-	build_install_sslibev exp1
-	build_install_simpleobfs exp1_trusty
-	;;
-xenial|yakkety)
-	build_install_libcork debian
-	build_install_libcorkipset debian
-	build_install_libbloom exp1
-	build_install_sslibev exp1
-	build_install_simpleobfs exp1
+	build_install_libbloom trusty
+	patch_sslibev_dh9
+	build_install_sslibev
+	build_install_simpleobfs trusty
 	;;
 *)
 	echo Your system $OSID/$OSVER is not supported yet.

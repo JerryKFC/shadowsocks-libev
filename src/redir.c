@@ -89,6 +89,7 @@ static void close_and_free_server(EV_P_ server_t *server);
 int verbose        = 0;
 int reuse_port     = 0;
 int keep_resolving = 1;
+int disable_sni    = 0;
 
 static crypto_t *crypto;
 
@@ -239,23 +240,24 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
     if (!remote->send_ctx->connected) {
-        // SNI
-        int ret       = 0;
-        uint16_t port = 0;
-
-        if (AF_INET6 == server->destaddr.ss_family) { // IPv6
-            port = ntohs(((struct sockaddr_in6 *)&(server->destaddr))->sin6_port);
-        } else {                             // IPv4
-            port = ntohs(((struct sockaddr_in *)&(server->destaddr))->sin_port);
-        }
-        if (port == http_protocol->default_port)
-            ret = http_protocol->parse_packet(remote->buf->data,
-                                              remote->buf->len, &server->hostname);
-        else if (port == tls_protocol->default_port)
-            ret = tls_protocol->parse_packet(remote->buf->data,
-                                             remote->buf->len, &server->hostname);
-        if (ret > 0) {
-            server->hostname_len = ret;
+        if (!disable_sni) {
+            // SNI
+            int ret       = 0;
+            uint16_t port = 0;
+            if (AF_INET6 == server->destaddr.ss_family) { // IPv6
+                port = ntohs(((struct sockaddr_in6 *)&(server->destaddr))->sin6_port);
+            } else {                             // IPv4
+                port = ntohs(((struct sockaddr_in *)&(server->destaddr))->sin_port);
+            }
+            if (port == http_protocol->default_port)
+                ret = http_protocol->parse_packet(remote->buf->data,
+                                                  remote->buf->len, &server->hostname);
+            else if (port == tls_protocol->default_port)
+                ret = tls_protocol->parse_packet(remote->buf->data,
+                                                 remote->buf->len, &server->hostname);
+            if (ret > 0) {
+                server->hostname_len = ret;
+            }
         }
 
         ev_io_stop(EV_A_ & server_recv_ctx->io);
@@ -515,6 +517,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
             int err = crypto->encrypt(abuf, server->e_ctx, BUF_SIZE);
             if (err) {
                 LOGE("invalid password or cipher");
+                bfree(abuf);
                 close_and_free_remote(EV_A_ remote);
                 close_and_free_server(EV_A_ server);
                 return;
@@ -523,6 +526,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
             err = crypto->encrypt(remote->buf, server->e_ctx, BUF_SIZE);
             if (err) {
                 LOGE("invalid password or cipher");
+                bfree(abuf);
                 close_and_free_remote(EV_A_ remote);
                 close_and_free_server(EV_A_ server);
                 return;
@@ -1065,6 +1069,9 @@ main(int argc, char **argv)
         if (reuse_port == 0) {
             reuse_port = conf->reuse_port;
         }
+        if (disable_sni == 0) {
+            disable_sni = conf->disable_sni;
+        }
         if (fast_open == 0) {
             fast_open = conf->fast_open;
         }
@@ -1073,6 +1080,9 @@ main(int argc, char **argv)
             nofile = conf->nofile;
         }
 #endif
+        if (ipv6first == 0) {
+            ipv6first = conf->ipv6_first;
+        }
 	dscp_num = conf->dscp_num;
 	dscp = conf->dscp;
     }
@@ -1130,8 +1140,8 @@ main(int argc, char **argv)
 #endif
     }
 
+    USE_SYSLOG(argv[0], pid_flags);
     if (pid_flags) {
-        USE_SYSLOG(argv[0]);
         daemonize(pid_path);
     }
 
@@ -1241,17 +1251,17 @@ main(int argc, char **argv)
         }
 
         if(listen_ctx_current->tos) {
-            LOGI("listening at %s:%s (TOS/DSCP 0x%x)", local_addr, local_port, listen_ctx_current->tos);
+            LOGI("listening at %s:%s (TOS 0x%x)", local_addr, local_port, listen_ctx_current->tos);
         } else {
             LOGI("listening at %s:%s", local_addr, local_port);
         }
 
         // Handle additionals TOS/DSCP listening ports
         if (dscp_num > 0) {
-            listen_ctx_current = (listen_ctx_t*) malloc(sizeof(listen_ctx_t));
+            listen_ctx_current = (listen_ctx_t*) ss_malloc(sizeof(listen_ctx_t));
             listen_ctx_current = memcpy(listen_ctx_current, &listen_ctx, sizeof(listen_ctx_t));
             local_port = dscp[dscp_num-1].port;
-            listen_ctx_current->tos = dscp[dscp_num-1].dscp;
+            listen_ctx_current->tos = dscp[dscp_num-1].dscp << 2;
         }
     } while (dscp_num-- > 0);
 

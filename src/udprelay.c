@@ -85,10 +85,11 @@ static void query_resolve_cb(struct sockaddr *addr, void *data);
 static void close_and_free_remote(EV_P_ remote_ctx_t *ctx);
 static remote_ctx_t *new_remote(int fd, server_ctx_t *server_ctx);
 
-#ifdef ANDROID
+#ifdef __ANDROID__
 extern uint64_t tx;
 extern uint64_t rx;
 extern int vpn;
+extern void stat_update_cb();
 #endif
 
 extern int verbose;
@@ -193,7 +194,7 @@ hash_key(const int af, const struct sockaddr_storage *addr)
 
 #if defined(MODULE_REDIR) || defined(MODULE_REMOTE)
 static int
-construct_udprealy_header(const struct sockaddr_storage *in_addr,
+construct_udprelay_header(const struct sockaddr_storage *in_addr,
                           char *addr_header)
 {
     int addr_header_len = 0;
@@ -222,7 +223,7 @@ construct_udprealy_header(const struct sockaddr_storage *in_addr,
 #endif
 
 static int
-parse_udprealy_header(const char *buf, const size_t buf_len,
+parse_udprelay_header(const char *buf, const size_t buf_len,
                       char *host, char *port, struct sockaddr_storage *storage)
 {
     const uint8_t atyp = *(uint8_t *)buf;
@@ -696,8 +697,9 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
         ERROR("[udp] remote_recv_recvfrom");
         goto CLEAN_UP;
     } else if (r > packet_size) {
-        LOGE("[udp] remote_recv_recvfrom fragmentation");
-        goto CLEAN_UP;
+        if (verbose) {
+            LOGI("[udp] remote_recv_recvfrom fragmentation");
+        }
     }
 
     buf->len = r;
@@ -712,14 +714,14 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 #ifdef MODULE_REDIR
     struct sockaddr_storage dst_addr;
     memset(&dst_addr, 0, sizeof(struct sockaddr_storage));
-    int len = parse_udprealy_header(buf->data, buf->len, NULL, NULL, &dst_addr);
+    int len = parse_udprelay_header(buf->data, buf->len, NULL, NULL, &dst_addr);
 
     if (dst_addr.ss_family != AF_INET && dst_addr.ss_family != AF_INET6) {
         LOGI("[udp] ss-redir does not support domain name");
         goto CLEAN_UP;
     }
 #else
-    int len = parse_udprealy_header(buf->data, buf->len, NULL, NULL, NULL);
+    int len = parse_udprelay_header(buf->data, buf->len, NULL, NULL, NULL);
 #endif
 
     if (len == 0) {
@@ -735,8 +737,9 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     buf->len -= len;
     memmove(buf->data, buf->data + len, buf->len);
 #else
-#ifdef ANDROID
+#ifdef __ANDROID__
     rx += buf->len;
+    stat_update_cb();
 #endif
     // Construct packet
     brealloc(buf, buf->len + 3, buf_size);
@@ -756,7 +759,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     int addr_header_len = remote_ctx->addr_header_len;
 
     if (remote_ctx->af == AF_INET || remote_ctx->af == AF_INET6) {
-        addr_header_len = construct_udprealy_header(&src_addr, addr_header_buf);
+        addr_header_len = construct_udprelay_header(&src_addr, addr_header_buf);
         addr_header     = addr_header_buf;
     }
 
@@ -775,8 +778,9 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 #endif
 
     if (buf->len > packet_size) {
-        LOGE("[udp] remote_recv_sendto fragmentation");
-        goto CLEAN_UP;
+        if (verbose) {
+            LOGI("[udp] remote_recv_sendto fragmentation");
+        }
     }
 
     size_t remote_src_addr_len = get_sockaddr_len((struct sockaddr *)&remote_ctx->src_addr);
@@ -878,8 +882,9 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         ERROR("[udp] server_recvmsg");
         goto CLEAN_UP;
     } else if (buf->len > packet_size) {
-        ERROR("[udp] UDP server_recv_recvmsg fragmentation");
-        goto CLEAN_UP;
+        if (verbose) {
+            LOGI("[udp] UDP server_recv_recvmsg fragmentation");
+        }
     }
 
     if (get_dstaddr(&msg, &dst_addr)) {
@@ -899,8 +904,9 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         ERROR("[udp] server_recv_recvfrom");
         goto CLEAN_UP;
     } else if (r > packet_size) {
-        ERROR("[udp] server_recv_recvfrom fragmentation");
-        goto CLEAN_UP;
+        if (verbose) {
+            LOGI("[udp] server_recv_recvfrom fragmentation");
+        }
     }
 
     buf->len = r;
@@ -922,7 +928,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
 #ifdef MODULE_LOCAL
 #if !defined(MODULE_TUNNEL) && !defined(MODULE_REDIR)
-#ifdef ANDROID
+#ifdef __ANDROID__
     tx += buf->len;
 #endif
     uint8_t frag = *(uint8_t *)(buf->data + 2);
@@ -947,16 +953,11 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
      * +----+------+------+----------+----------+----------+
      *
      * shadowsocks UDP Request (before encrypted)
-     * +------+----------+----------+----------+-------------+
-     * | ATYP | DST.ADDR | DST.PORT |   DATA   |  HMAC-SHA1  |
-     * +------+----------+----------+----------+-------------+
-     * |  1   | Variable |    2     | Variable |     10      |
-     * +------+----------+----------+----------+-------------+
-     *
-     * If ATYP & ONETIMEAUTH_FLAG(0x10) != 0, Authentication (HMAC-SHA1) is enabled.
-     *
-     * The key of HMAC-SHA1 is (IV + KEY) and the input is the whole packet.
-     * The output of HMAC-SHA is truncated to 10 bytes (leftmost bits).
+     * +------+----------+----------+----------+
+     * | ATYP | DST.ADDR | DST.PORT |   DATA   |
+     * +------+----------+----------+----------+
+     * |  1   | Variable |    2     | Variable |
+     * +------+----------+----------+----------+
      *
      * shadowsocks UDP Response (before encrypted)
      * +------+----------+----------+----------+
@@ -976,7 +977,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
 #ifdef MODULE_REDIR
     char addr_header[512] = { 0 };
-    int addr_header_len   = construct_udprealy_header(&dst_addr, addr_header);
+    int addr_header_len   = construct_udprelay_header(&dst_addr, addr_header);
 
     if (addr_header_len == 0) {
         LOGE("[udp] failed to parse tproxy addr");
@@ -1052,7 +1053,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     struct sockaddr_storage dst_addr;
     memset(&dst_addr, 0, sizeof(struct sockaddr_storage));
 
-    int addr_header_len = parse_udprealy_header(buf->data + offset, buf->len - offset,
+    int addr_header_len = parse_udprelay_header(buf->data + offset, buf->len - offset,
                                                 host, port, &dst_addr);
     if (addr_header_len == 0) {
         // error in parse header
@@ -1148,7 +1149,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         }
 #endif
 
-#ifdef ANDROID
+#ifdef __ANDROID__
         if (vpn) {
             if (protect_socket(remotefd) == -1) {
                 ERROR("protect_socket");
@@ -1186,8 +1187,9 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
     if (buf->len > packet_size) {
-        LOGE("[udp] server_recv_sendto fragmentation");
-        goto CLEAN_UP;
+        if (verbose) {
+            LOGI("[udp] server_recv_sendto fragmentation");
+        }
     }
 
     int s = sendto(remote_ctx->fd, buf->data, buf->len, 0, remote_addr, remote_addr_len);
@@ -1202,8 +1204,9 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     int need_query = 0;
 
     if (buf->len - addr_header_len > packet_size) {
-        LOGE("[udp] server_recv_sendto fragmentation");
-        goto CLEAN_UP;
+        if (verbose) {
+            LOGI("[udp] server_recv_sendto fragmentation");
+        }
     }
 
     if (remote_ctx != NULL) {
@@ -1373,7 +1376,7 @@ init_udprelay(const char *server_host, const char *server_port,
 
     server_ctx_list[server_num++] = server_ctx;
 
-    return 0;
+    return serverfd;
 }
 
 void

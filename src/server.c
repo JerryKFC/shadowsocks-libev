@@ -516,7 +516,7 @@ connect_to_remote(EV_P_ struct addrinfo *res,
         endpoints.sae_dstaddrlen = res->ai_addrlen;
 
         struct iovec iov;
-        iov.iov_base = server->buf->data + server->buf->idx;
+        iov.iov_base = server->buf->data;
         iov.iov_len  = server->buf->len;
         size_t len;
         int s = connectx(sockfd, &endpoints, SAE_ASSOCID_ANY, CONNECT_DATA_IDEMPOTENT,
@@ -525,9 +525,8 @@ connect_to_remote(EV_P_ struct addrinfo *res,
             s = len;
         }
 #else
-        ssize_t s = sendto(sockfd, server->buf->data + server->buf->idx,
-                           server->buf->len, MSG_FASTOPEN, res->ai_addr,
-                           res->ai_addrlen);
+        ssize_t s = sendto(sockfd, server->buf->data, server->buf->len,
+                MSG_FASTOPEN, res->ai_addr, res->ai_addrlen);
 #endif
         if (s == -1) {
             if (errno == CONNECT_IN_PROGRESS || errno == EAGAIN
@@ -542,12 +541,9 @@ connect_to_remote(EV_P_ struct addrinfo *res,
             } else {
                 ERROR("sendto");
             }
-        } else if (s <= server->buf->len) {
+        } else {
             server->buf->idx += s;
             server->buf->len -= s;
-        } else {
-            server->buf->idx = 0;
-            server->buf->len = 0;
         }
     }
 #endif
@@ -616,7 +612,7 @@ void setTosFromConnmark(remote_t* remote, server_t* server)
 			struct sockaddr_storage from_addr;
 			len = sizeof from_addr;
 			if(getpeername(remote->fd, (struct sockaddr*)&from_addr, &len) == 0) {
-				if((server->tracker = (struct dscptracker*) malloc(sizeof(struct dscptracker))))
+				if((server->tracker = (struct dscptracker*) ss_malloc(sizeof(struct dscptracker))))
 				{
 					if ((server->tracker->ct = nfct_new())) {
 						// Build conntrack query SELECT
@@ -706,6 +702,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             report_addr(server->fd, MALICIOUS, "malicious fragmentation");
             close_and_free_remote(EV_A_ remote);
             close_and_free_server(EV_A_ server);
+            return;
         }
         server->frag++;
         return;
@@ -736,11 +733,11 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         /*
          * Shadowsocks TCP Relay Header:
          *
-         *    +------+----------+----------+----------------+
-         *    | ATYP | DST.ADDR | DST.PORT |    HMAC-SHA1   |
-         *    +------+----------+----------+----------------+
-         *    |  1   | Variable |    2     |      10        |
-         *    +------+----------+----------+----------------+
+         *    +------+----------+----------+
+         *    | ATYP | DST.ADDR | DST.PORT |
+         *    +------+----------+----------+
+         *    |  1   | Variable |    2     |
+         *    +------+----------+----------+
          *
          */
 
@@ -885,7 +882,9 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
                 // XXX: should handle buffer carefully
                 if (server->buf->len > 0) {
-                    memcpy(remote->buf->data, server->buf->data, server->buf->len);
+                    brealloc(remote->buf, server->buf->len, BUF_SIZE);
+                    memcpy(remote->buf->data, server->buf->data + server->buf->idx,
+                            server->buf->len);
                     remote->buf->len = server->buf->len;
                     remote->buf->idx = 0;
                     server->buf->len = 0;
@@ -1041,8 +1040,9 @@ server_resolve_cb(struct sockaddr *addr, void *data)
 
             // XXX: should handle buffer carefully
             if (server->buf->len > 0) {
+                brealloc(remote->buf, server->buf->len, BUF_SIZE);
                 memcpy(remote->buf->data, server->buf->data + server->buf->idx,
-                       server->buf->len);
+                        server->buf->len);
                 remote->buf->len = server->buf->len;
                 remote->buf->idx = 0;
                 server->buf->len = 0;
@@ -1726,8 +1726,8 @@ main(int argc, char **argv)
     }
 #endif
 
+    USE_SYSLOG(argv[0], pid_flags);
     if (pid_flags) {
-        USE_SYSLOG(argv[0]);
         daemonize(pid_path);
     }
 
